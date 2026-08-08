@@ -62,7 +62,7 @@ Features must never import from other features. Cross-feature navigation uses ar
 | `di/` | `injection_container.dart` (getIt + `@InjectableInit`), `register_module.dart` (`@module` for `FlutterSecureStorage`, `GlobalKey<NavigatorState>`, `Dio`) |
 | `helpers/` | `DialogHelper`, `SnackBarHelper` (`@lazySingleton`, constructor-injected with `GlobalKey<NavigatorState>`); `BottomSheetHelper` (static utility class — takes `BuildContext` at call site, no DI registration) |
 | `network/` | `ApiManager`, `ApiResult` (sealed internal transport — never imported outside `ApiManager`; converted to `Either<Failure, T>` before leaving the network layer), `Failure` hierarchy, `failure_messages.dart`, `DioFactory`, `AuthInterceptor`, `ConnectivityHelper` |
-| `router/` | `AppRouter.generateRoute`, `AppRoutes` (route name constants), `args/` (typed args classes per screen) |
+| `router/` | `AppRouter.router` (`GoRouter` instance), `AppRoutes` (route name constants), `args/` (typed args classes per screen) |
 | `storage/` | `SecureStorageHelper` (`@lazySingleton`, wraps `FlutterSecureStorage`) |
 | `theme/` | `AppColors`, `AppFontWeight`, `AppTextStyles`, `AppTheme.lightTheme` |
 | `widgets/` | `AppLoadingIndicator`, `EmptyStateWidget`, `ErrorStateWidget` |
@@ -97,7 +97,7 @@ features/<feature>/
 ## Architecture rules
 
 ### 1. Auth is invisible to the data layer
-`AuthInterceptor` handles Bearer token injection and 401 → logout. Data sources never read tokens, build headers, or call auth services.
+`AuthInterceptor` handles Bearer token injection and silent token refresh on 401 — concurrent 401s share one in-flight refresh call, the failed request is retried once with the new token, and only a failed refresh triggers logout. Data sources never read tokens, build headers, or call auth services.
 
 ### 2. No try/catch outside ApiManager
 `ApiManager` is the sole error boundary. It converts every `DioException` to `Either<Failure, T>`. Data source methods return that `Either` directly — no wrapping, no try/catch.
@@ -129,7 +129,7 @@ If a screen's total widget code is under ~250 lines and contains no embedded `St
 
 Both forms come from the `injectable` package: `@lazySingleton` is the no-arg const shorthand for `@LazySingleton()`; `@LazySingleton(as: Repo)` is used when binding a concrete class to an interface. Use whichever fits — they are not inconsistent.
 
-`BlocProvider` is always created in `AppRouter.generateRoute`, never inside a screen widget. When a screen depends on more than one cubit, use `MultiBlocProvider` in the same route case instead of nesting `BlocProvider` calls.
+`BlocProvider` is always created in the `GoRoute` builder inside `AppRouter.router`, never inside a screen widget. When a screen depends on more than one cubit, use `MultiBlocProvider` in the same route's builder instead of nesting `BlocProvider` calls.
 
 ---
 
@@ -139,20 +139,22 @@ Both forms come from the `injectable` package: `@lazySingleton` is the no-arg co
 DioException → ApiManager._mapDioError() → Failure subtype
                                           → Left(failure)
 cubit: result.fold(
-  (failure) => emit(XxxError(failureToMessage(failure))),  // import from core
+  (failure) => emit(XxxError(failureToMessage(failure), errorCode: failure.errorCode)),
   (data)    => emit(XxxSuccess(data)),
 )
 ```
 
 `failureToMessage()` lives in `lib/core/network/failure_messages.dart`. Import it as:
 ```dart
-import 'package:booksplatform/core/network/failure_messages.dart' as core;
+import 'package:<package_name>/core/network/failure_messages.dart' as core;
 // usage: core.failureToMessage(failure)
 ```
 
 The `as core` alias is **required** in any cubit that also imports a feature-level `failure_messages.dart` — without it the two top-level functions clash. Use it consistently across all cubits for uniformity.
 
 Create a feature-level override (`presentation/cubit/failure_messages.dart`) only when a feature has unique status codes (e.g. 423 Account Locked) — delegate all other cases to core.
+
+If the backend includes a stable `errorCode` on an error response (independent of `message`, which is display text and can be reworded/localized), `ApiManager` captures it onto `Failure.errorCode`. Cubits/screens may read it to decide *behavior* — navigation, disabling a button, forcing logout — never to decide what text to display; `message`/`failureToMessage()` stays the only source of display text. Prefer `errorCode` over `statusCode` matching when several distinct failures share one HTTP status (e.g. multiple 401 cases needing different handling). Not every endpoint sends `errorCode` yet, so every `errorCode` switch needs a fallback for `null`/unmatched values.
 
 ---
 
@@ -172,7 +174,9 @@ Create a feature-level override (`presentation/cubit/failure_messages.dart`) onl
 New screens:
 1. Add route name constant to `lib/core/router/app_routes.dart`
 2. If the screen needs navigation arguments, create `lib/core/router/args/<screen>_args.dart` (immutable plain Dart class)
-3. Add a case to `AppRouter.generateRoute` that casts `settings.arguments` with a null guard (null → `_unknown(settings)`) and wraps the screen in `BlocProvider(create: (_) => getIt<XxxCubit>())`
+3. Add a `GoRoute` to the `routes:` list in `AppRouter.router` that casts `state.extra` with a null guard (null → `_unknown(state)`) and wraps the screen in `BlocProvider(create: (_) => getIt<XxxCubit>())`
+
+Navigate with `context.pushNamed(AppRoutes.xxx, extra: XxxArgs(...))` from widgets, or `getIt<GoRouter>().pushNamed(...)` from non-widget code (e.g. a push-notification tap handler) — the reason this project moved off manual `Navigator` routing.
 
 ---
 
@@ -188,7 +192,7 @@ sealed class XxxState extends Equatable {
 final class XxxInitial   extends XxxState { const XxxInitial(); }
 final class XxxLoading   extends XxxState { const XxxLoading(); }
 final class XxxSuccess   extends XxxState { /* data fields, override props */ }
-final class XxxError     extends XxxState { final String message; ... }
+final class XxxError     extends XxxState { final String message; final String? errorCode; ... }
 ```
 
 ---
@@ -222,7 +226,7 @@ Verify new registrations appear in `lib/core/di/injection_container.config.dart`
   1. Dart SDK (`dart:`)
   2. Flutter SDK (`package:flutter/`)
   3. Third-party packages (`package:`)
-  4. Project imports (`package:booksplatform/`)
+  4. Project imports (`package:<package_name>/`)
   - Use relative imports within the same feature; use package imports across features.
   - Never leave unused imports.
 

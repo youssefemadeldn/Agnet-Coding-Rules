@@ -16,7 +16,7 @@ Two files per cubit concern. Replace all `<Placeholder>` tokens before use.
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:injectable/injectable.dart';
 
-import 'package:booksplatform/core/network/failure_messages.dart' as core;
+import 'package:<package_name>/core/network/failure_messages.dart' as core;
 import '../../domain/repositories/base_<feature>_repository.dart';
 import '<action>_state.dart';
 
@@ -32,7 +32,7 @@ class <Action>Cubit extends Cubit<<Action>State> {
     emit(const <Action>Loading());
     final result = await _repository.<method>(<args>);
     result.fold(
-      (failure) => emit(<Action>Error(core.failureToMessage(failure))),
+      (failure) => emit(<Action>Error(core.failureToMessage(failure), errorCode: failure.errorCode)),
       (data)    => emit(<Action>Success(data)),
     );
   }
@@ -71,9 +71,10 @@ final class <Action>Success extends <Action>State {
 
 final class <Action>Error extends <Action>State {
   final String message;
-  const <Action>Error(this.message);
+  final String? errorCode;
+  const <Action>Error(this.message, {this.errorCode});
   @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [message, errorCode];
 }
 ```
 
@@ -85,4 +86,5 @@ final class <Action>Error extends <Action>State {
 - **Never `@lazySingleton` for a cubit** — the sole exception is `CartCubit` (CLAUDE.md DI table). All other cubits are `@injectable` (factory).
 - **`as core` alias is required** for `failureToMessage` in any cubit that also imports a feature-level `failure_messages.dart`. Use it consistently in all cubits for uniformity.
 - **Use case swap-in:** if §2 Rule 4 applies, inject `<Verb><Noun>UseCase` instead of the repository and call `await _useCase(<args>)`.
-- **`BlocProvider`** is created in `AppRouter.generateRoute`, never inside the screen widget.
+- **`BlocProvider`** is created in the `GoRoute` builder inside `AppRouter.router`, never inside the screen widget.
+- **`errorCode` for behavior, not display:** `<Action>Error.errorCode` mirrors `Failure.errorCode` (nullable — not every backend/endpoint sends one). A screen's `BlocListener` may switch on it for navigation/retry/forced-logout side effects, always with a fallback for null/unmatched values; `message` stays the only display text (feature guide §9).

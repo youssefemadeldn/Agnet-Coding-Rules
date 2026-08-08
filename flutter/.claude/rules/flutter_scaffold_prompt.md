@@ -12,11 +12,11 @@ screens or business logic — only the infrastructure layer.
 
 **Package context (ignore versions — use latest compatible):**
 - HTTP & networking: dio, pretty_dio_logger
-- State management: flutter_bloc (Cubits only, no classic BLoC)
+- State management: flutter_bloc (Cubit by default; Bloc only for complex event-driven flows Cubit can't express cleanly — see CLAUDE.md's "State management discipline")
 - DI: get_it + injectable + injectable_generator (build_runner)
 - Functional programming: dartz (Either for error handling)
 - Storage: flutter_secure_storage
-- Routing: manual (app_router.dart — no go_router or auto_route)
+- Routing: go_router (declarative, Navigator 2.0)
 - UI utilities: flutter_screenutil, flutter_svg, cached_network_image, shimmer
 - Connectivity: connectivity_plus
 - Equality: equatable
@@ -147,7 +147,7 @@ foundation files, and DI scope (if registered).
 - `lib/core/constants/app_constants.dart`
   Exports: kDesignWidth (390.0), kDesignHeight (844.0), kAppName,
   kAnimationDuration, kSplashDuration, kDefaultPageSize, kTokenKey,
-  kUserKey.
+  kRefreshTokenKey, kUserKey.
 
 - `lib/core/constants/api_constants.dart`
   Exports: ApiConstants class with static `baseUrl` getter (env-aware via
@@ -264,11 +264,14 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
 **Networking:**
 
 - `lib/core/network/failure.dart`
-  Abstract class Failure extends Equatable.
-  Subtypes: ServerFailure(statusCode, message), NetworkFailure,
-  UnauthorizedFailure, CacheFailure, ValidationFailure(message),
+  Abstract class Failure extends Equatable, with an optional `final String? errorCode`
+  (default null) on the base class — a stable, non-localized code the backend may send
+  alongside `message` (e.g. `"Auth.InvalidCredentials"`), for cubits to branch on instead
+  of matching `message` text. Not every backend/endpoint sends one — always nullable.
+  Subtypes: ServerFailure(statusCode, message, {errorCode}), NetworkFailure,
+  UnauthorizedFailure({errorCode}), CacheFailure, ValidationFailure(message, {errorCode}),
   UnexpectedFailure(message).
-  Each overrides props for Equatable.
+  Each overrides props for Equatable (include errorCode where the subtype carries it).
 
 - `lib/core/network/api_result.dart`
   Internal sealed class (not exposed outside network layer).
@@ -277,17 +280,40 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
 
 - `lib/core/network/interceptors/auth_interceptor.dart`
   Extends Interceptor.
-  Constructor receives `SecureStorageHelper` **and `GlobalKey<NavigatorState>`**
+  Constructor receives `SecureStorageHelper` **and `GoRouter`**
   (both injected — NOT fetched from getIt inside the interceptor to avoid
   circular dependency).
   onRequest: reads token → if not null, sets Authorization: Bearer header;
   if null, skips silently (public route).
-  onError: if 401 → clears token via SecureStorageHelper →
-  `_navigatorKey.currentState?.pushNamedAndRemoveUntil(AppRoutes.login, ...)`.
+  onError — silent refresh, not eager logout: a 401 on the refresh-token call
+  itself (matched against `ApiConstants.refreshToken`) goes straight to logout,
+  no retry. Any other 401 attempts a silent refresh first: POST to
+  `ApiConstants.refreshToken` on a second, interceptor-free "bare" `Dio` (so the
+  refresh call can never recurse back into `AuthInterceptor`), response
+  unwrapped via `unwrapServiceResult` expecting `{ accessToken, refreshToken }`
+  in `data`. Concurrent 401s share one in-flight refresh via a
+  `Completer<String?>` — only the first triggers a network call; the rest await
+  the same future instead of causing a refresh storm. On success: save both new
+  tokens via `SecureStorageHelper`, retry the original failed request once on
+  the bare Dio with the new Authorization header, and `handler.resolve()` it —
+  the original caller never sees the 401. On failure (no refresh token stored,
+  the refresh call throws, or it 401s itself): clear both tokens via
+  `SecureStorageHelper` → `_router.go(AppRoutes.login)` → `handler.next(err)` so
+  the original error still reaches `ApiManager` as a normal `Failure`.
+  `.go` (path-based, not `.goNamed`) replaces
+  the whole stack (same effect as the old `pushNamedAndRemoveUntil`) while
+  keeping `GoRouter`'s own route-matching state in sync — calling the raw
+  `Navigator` underneath it directly would desync `GoRouter`'s idea of the
+  current route from what's actually on screen, which matters once a web
+  build exists (browser back/forward + URL bar). Prefer `.go`/`.push` with a
+  path over `.goNamed`/`.pushNamed` for any target that might not have a
+  registered route yet (e.g. during scaffold-phase development before every
+  screen exists) — an unmatched path falls through to `errorBuilder`, while
+  an unmatched name throws immediately.
 
 - `lib/core/network/dio_factory.dart`
   Factory class (`@lazySingleton`) — produces the Dio singleton.
-  Constructor receives `SecureStorageHelper` and `GlobalKey<NavigatorState>`,
+  Constructor receives `SecureStorageHelper` and `GoRouter`,
   both forwarded to `AuthInterceptor`.
   Creates Dio with BaseOptions from ApiConstants.
   Interceptor order — **PrettyDioLogger first (when `kDebugMode`), then
@@ -296,7 +322,7 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   in debug builds.
   The produced Dio instance is registered as `@singleton` via RegisterModule.
   Construction order: FlutterSecureStorage → SecureStorageHelper →
-  GlobalKey<NavigatorState> → DioFactory → Dio.
+  GlobalKey<NavigatorState> → AppRouter.router (GoRouter) → DioFactory → Dio.
 
 - `lib/core/network/api_manager.dart`
   Registered as @lazySingleton.
@@ -311,6 +337,9 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   `DioExceptionType.badResponse` with a null `statusCode` maps to
   `UnexpectedFailure`, never `ServerFailure(0, ...)` — `ServerFailure` only
   carries real HTTP statuses.
+  When `e.response?.data` is a JSON object containing an `errorCode` key, `_mapDioError`
+  reads it into the constructed `Failure` — defensively: a non-Map body, a missing key, or
+  a non-string value all resolve to `errorCode: null` rather than throwing.
   Conversion chain: DioResponse → ApiResult → Either<Failure, T>.
   Never throws — always returns Either.
 
@@ -329,7 +358,7 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   - All other subtypes: environment-independent, always user-friendly.
   Single source of truth for error strings. Never duplicated per feature.
   Feature layer imports as:
-  `import 'package:booksplatform/core/network/failure_messages.dart' as core;`
+  `import 'package:<package_name>/core/network/failure_messages.dart' as core;`
 
 - `lib/core/network/api_envelope.dart` *(create only when backend wraps every response)*
   Top-level function: `unwrapServiceResult(json, fromJson)`.
@@ -351,15 +380,16 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   @singleton
   GlobalKey<NavigatorState> get navigatorKey => GlobalKey<NavigatorState>();
   ```
-  Consumers — `DialogHelper`, `SnackBarHelper`, `AuthInterceptor`, `DioFactory`,
-  and `main.dart`'s `MaterialApp` — receive it via constructor injection or
-  `getIt<GlobalKey<NavigatorState>>()`. `injection_container.dart` does **no**
-  manual registration of the key.
+  Consumers — `DialogHelper`, `SnackBarHelper` (constructor injection), and
+  `AppRouter.router`'s `navigatorKey:` parameter — receive it via constructor
+  injection or `getIt<GlobalKey<NavigatorState>>()`. `injection_container.dart`
+  does **no** manual registration of the key.
 
 - `lib/core/router/app_routes.dart`
-  Exports: AppRoutes class with static const String fields for every route.
-  Initially: splash ('/'), login ('/login'), register ('/register'),
-  home ('/home'), unknown ('/unknown').
+  Exports: AppRoutes class with static const String fields for every route
+  **name** (used as each `GoRoute`'s `name:`, not a raw path). Initially:
+  splash ('/'), login ('/login'), register ('/register'), home ('/home'),
+  unknown ('/unknown').
 
 - `lib/core/router/args/` *(directory)*
   Contains one file per screen that requires navigation arguments.
@@ -367,22 +397,29 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   Args classes are immutable plain Dart — no Equatable needed.
   Placed in core (not inside features) so any feature can import and construct
   args before navigating without creating Feature → Feature import violations.
-  `AppRouter.generateRoute` casts `settings.arguments` with a null guard;
-  null → `_unknown(settings)`.
+  Each `GoRoute.builder` casts `state.extra` with a null guard;
+  null → `_unknown(state)`.
 
 - `lib/core/router/app_router.dart`
-  Static method: generateRoute(RouteSettings settings) → Route<dynamic>.
-  Switch on settings.name → returns MaterialPageRoute for each known route.
-  Each route that needs arguments receives a typed argument class
-  (e.g. HomeArgs, LoginArgs) — no raw Map<String, dynamic> casting ever.
-  Default case → returns route to UnknownScreen (a simple placeholder widget
+  Static method: `AppRouter.router(GlobalKey<NavigatorState> navigatorKey)` →
+  `GoRouter`, built with the passed-in key and a `routes:` list of
+  `GoRoute` entries, one per `AppRoutes` constant. Each route that needs
+  arguments reads a typed argument class off `state.extra` (e.g. `HomeArgs`,
+  `LoginArgs`) — no raw `Map<String, dynamic>` casting ever. Unmatched routes
+  fall through to `errorBuilder` → UnknownScreen (a simple placeholder widget
   defined inline in this file).
-  A private static `_unknown(RouteSettings settings)` helper is extracted from
-  the switch — every null-guard on a missing/invalid args cast delegates to it,
-  keeping all route cases consistent.
+  A private static `_unknown(GoRouterState state)` helper is extracted — every
+  null-guard on a missing/invalid `extra` cast delegates to it, keeping all
+  route entries consistent.
   When a screen lives in a folder (`pages/<screen_name>/<screen_name>_screen.dart`),
   the import path in `AppRouter` reflects that — the `BlocProvider` creation pattern
   is identical regardless of flat or folder layout.
+  `AppRouter.router` is also registered in `RegisterModule` as `@singleton`
+  (`GoRouter` type) so non-widget code — most notably a future push-notification
+  tap handler — can navigate via `getIt<GoRouter>().pushNamed(AppRoutes.xxx,
+  extra: XxxArgs(...))` with no `BuildContext`. Call sites inside widgets use
+  `context.pushNamed(AppRoutes.xxx, extra: XxxArgs(...))` instead of the old
+  `Navigator.pushNamed(context, AppRoutes.xxx, arguments: ...)`.
 
 **Localization:**
 
@@ -429,9 +466,10 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   Registered as @lazySingleton.
   Constructor receives FlutterSecureStorage (injected).
   Typed methods: saveToken(String), getToken() → Future<String?>,
-  deleteToken(), saveString(key, value), getString(key) → Future<String?>,
+  deleteToken(), saveRefreshToken(String), getRefreshToken() → Future<String?>,
+  deleteRefreshToken(), saveString(key, value), getString(key) → Future<String?>,
   deleteKey(key), clearAll().
-  Keys sourced from AppConstants (kTokenKey, kUserKey).
+  Keys sourced from AppConstants (kTokenKey, kRefreshTokenKey, kUserKey).
 
 **Dependency Injection:**
 
@@ -452,6 +490,11 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
       `AndroidOptions(encryptedSharedPreferences: true)`; that API is deprecated
       and will be removed in v11.
     - `GlobalKey<NavigatorState>` → `@singleton`
+    - `GoRouter` → `@singleton` (`AppRouter.router`, built from the injected
+      `GlobalKey<NavigatorState>`) — registering it in DI, not just building it
+      inline in `main.dart`, is what lets non-widget code (push-notification
+      handlers, `AuthInterceptor`) navigate via `getIt<GoRouter>()` with no
+      `BuildContext`.
     - `Dio` → `@singleton` (built by `DioFactory.create()`)
     - `SharedPreferences` → `@preResolve @singleton`
       Async provider — annotate with both `@preResolve` and `@singleton` so injectable
@@ -479,11 +522,9 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   `EasyLocalization` provider above it, so it returns:
   ScreenUtilInit(
     designSize: Size(kDesignWidth, kDesignHeight),
-    builder: (context, child) => MaterialApp(
-      navigatorKey: getIt<GlobalKey<NavigatorState>>(),
+    builder: (context, child) => MaterialApp.router(
+      routerConfig: getIt<GoRouter>(),
       theme: AppTheme.lightTheme,
-      onGenerateRoute: AppRouter.generateRoute,
-      initialRoute: AppRoutes.splash,
       localizationsDelegates: context.localizationDelegates,
       supportedLocales: context.supportedLocales,
       locale: context.locale,
@@ -492,7 +533,10 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
   The three `context.*` properties wire `easy_localization` into Flutter's locale system
   so that `Directionality`, `Localizations`, and locale-aware widgets all update when
   `context.setLocale(...)` is called. Omitting any of them silently breaks locale switching.
-  No top-level `navigatorKey` import — the key is pulled from `getIt`
+  No `navigatorKey`, `onGenerateRoute`, or `initialRoute` on `MaterialApp.router` —
+  `GoRouter` owns all three internally (the navigator key was passed into
+  `AppRouter.router`'s constructor, and the initial location defaults to the
+  `AppRoutes.splash` route). The router itself is pulled from `getIt`
   (safe because `configureDependencies()` is awaited before `runApp`).
   No feature logic. No hardcoded strings. No colors. No sizes.
 
@@ -510,19 +554,21 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
 
 3. **Auth interceptor circular dependency:** Construction order must be:
    FlutterSecureStorage → SecureStorageHelper → GlobalKey<NavigatorState> →
-   DioFactory → AuthInterceptor (created inside `DioFactory.create()` with
-   both deps already resolved) → Dio.
-   AuthInterceptor receives `SecureStorageHelper` **and**
-   `GlobalKey<NavigatorState>` via constructor injection, NOT via getIt lookup
-   inside the interceptor.
+   AppRouter.router (GoRouter — needs only the navigator key; its route
+   builders reference `getIt<XxxCubit>()` lazily inside closures, so building
+   the router does not pull in Dio or repositories) → DioFactory →
+   AuthInterceptor (created inside `DioFactory.create()` with both deps
+   already resolved) → Dio.
+   AuthInterceptor receives `SecureStorageHelper` **and** `GoRouter` via
+   constructor injection, NOT via getIt lookup inside the interceptor.
 
 4. **ApiResult → Either conversion:** ApiManager is the single boundary.
    No class outside the network layer ever imports api_result.dart.
 
 5. **Typed route arguments:** Each screen that needs arguments has a dedicated
    immutable args class in `lib/core/router/args/<screen>_args.dart`.
-   `AppRouter.generateRoute` casts `settings.arguments` to the typed class with a
-   null guard (null → `_unknown(settings)`), never to `Map`.
+   Each `GoRoute.builder` casts `state.extra` to the typed class with a
+   null guard (null → `_unknown(state)`), never to `Map`.
    Args live in core so both feature and non-feature callers can import without
    cross-feature dependency violations. See feature guide §10 for full pattern.
 
@@ -578,6 +624,12 @@ These three widgets live in `lib/core/widgets/` and are used by every feature's
     Note: `EasyLocalization.ensureInitialized()` internally calls
     `WidgetsFlutterBinding.ensureInitialized()`; calling it explicitly first is still
     recommended for clarity.
+
+15. **Auth refresh must not recurse or storm:** The refresh POST goes out on a
+    second, interceptor-free "bare" `Dio` — if it reused the main `Dio`, its own
+    401 would re-enter `AuthInterceptor.onError` and recurse. Concurrent 401s
+    must share one in-flight refresh (a `Completer<String?>`) rather than each
+    firing its own refresh call.
 
 ---
 
