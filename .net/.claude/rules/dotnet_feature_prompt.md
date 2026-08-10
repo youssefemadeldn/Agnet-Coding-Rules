@@ -42,6 +42,10 @@
 
 **Rule:** never add an empty folder speculatively. Only create `Validators/Update<Entity>DtoValidator.cs` if an update endpoint actually exists; only create a background job file if the feature actually has recurring/scheduled work (see `templates/layers/T7-background-job.md`).
 
+**Rule 8 reminder:** any entity field in this file set that holds user-facing text (not an internal code/slug/enum) gets an `<Field>Ar` counterpart on the entity, in the same migration — see Rule 8 and `templates/layers/T1-entity.md`.
+
+**Rule 9 reminder:** the entity added here also gets a `Seed<Entity>Async` method added to `<Solution>.WebAPI/Helpers/MockDataSeeder.cs` in the same change — see Rule 9.
+
 ---
 
 ## 2. The Non-Negotiable Rules
@@ -60,7 +64,7 @@ public async Task<ServiceResult<ProductDetailsDto>> GetDetailsAsync(int id)
     if (product is null)
     {
         _logger.LogWarning("Product {ProductId} not found", id);
-        return ServiceResult<ProductDetailsDto>.NotFound($"Product {id} not found");
+        return ServiceResult<ProductDetailsDto>.NotFound(_localizer["Product.NotFound", id], "Product.NotFound");   // see Rule 8, Rule 10
     }
 
     return ServiceResult<ProductDetailsDto>.Ok(_mapper.Map<ProductDetailsDto>(product));
@@ -247,11 +251,124 @@ _logger.LogInformation($"Creating product {dto.Name}");   // ❌ interpolated st
 
 ---
 
+### Rule 8 — Every user-facing string ships bilingual (EN/AR) from the moment it's created
+
+Any entity field, DTO field, or service/validator message a client can see is built with English/Arabic support the moment it's created — not added later once someone actually asks for translation (CLAUDE.md Architecture rule 8).
+
+**Correct — entity + mapping resolve to one field:**
+```csharp
+// Entity
+public required string Name { get; set; }
+public string? NameAr { get; set; }
+
+// AutoMapper profile — resolves to ONE field; the client never sees both
+CreateMap<Product, ProductDetailsDto>()
+    .ForMember(d => d.Name, opt => opt.MapFrom(s =>
+        CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "ar" && !string.IsNullOrEmpty(s.NameAr)
+            ? s.NameAr
+            : s.Name));
+```
+
+**Correct — messages come from the localizer:**
+```csharp
+public class CreateProductDtoValidator : AbstractValidator<CreateProductDto>
+{
+    public CreateProductDtoValidator(IStringLocalizer<SharedResource> localizer)
+    {
+        RuleFor(x => x.Name).NotEmpty().WithMessage(localizer["Product.Name.Required"]);
+    }
+}
+
+// Service
+return ServiceResult<ProductDetailsDto>.NotFound(_localizer["Product.NotFound"], "Product.NotFound");   // see Rule 10
+```
+
+**Wrong — never do this:**
+```csharp
+// ❌ Entity has no Ar counterpart — retrofitting later means a migration plus backfilling every row
+public required string Name { get; set; }
+
+// ❌ Hardcoded English literal — looks localized because Accept-Language is wired in the pipeline,
+// but the message itself never actually changes with culture
+RuleFor(x => x.Name).NotEmpty().WithMessage("Name is required");
+return ServiceResult<ProductDetailsDto>.NotFound("Product not found");
+```
+
+See CLAUDE.md "Localization" and `templates/layers/T1-entity.md`, `T4-dto.md`, `T5-validator.md`.
+
+---
+
+### Rule 9 — Every new entity ships with dev-only mock seed data
+
+A new entity/table gets a matching `Seed<Entity>Async` method in `MockDataSeeder` in the same change that adds it — not deferred. The seed data covers a normal case and at least one deliberate edge case, and only ever runs behind `IsDevelopment()` (CLAUDE.md Architecture rule 9).
+
+**Correct:**
+```csharp
+// Helpers/MockDataSeeder.cs
+public static async Task SeedProductsAsync(YourSpaceDbContext context)
+{
+    if (await context.Products.AnyAsync()) return; // idempotent — skip if already seeded
+
+    var faker = new Faker<Product>()
+        .RuleFor(p => p.Name, f => f.Commerce.ProductName())
+        .RuleFor(p => p.Price, f => f.Random.Decimal(1, 500));
+
+    var products = faker.Generate(20);
+    products.Add(new Product { Name = "Edge Case — Zero Price", Price = 0 });       // boundary value
+    products.Add(new Product { Name = "Edge Case — Soft Deleted", DeletedAt = DateTime.UtcNow }); // status edge case
+
+    await context.Products.AddRangeAsync(products);
+    await context.SaveChangesAsync();
+}
+
+// Called only from Program.cs's IsDevelopment() block, via MockDataSeeder.SeedAsync(...)
+```
+
+**Wrong — never do this:**
+```csharp
+// ❌ New entity ships with zero seed data — nobody has sample rows to look at until someone remembers later
+public class Product { /* ... */ }   // no matching SeedProductsAsync anywhere
+
+// ❌ Seeding called outside the IsDevelopment() guard — fake rows would ship into Production
+await MockDataSeeder.SeedAsync(context);
+```
+
+See CLAUDE.md "Development Data Seeding."
+
+---
+
+### Rule 10 — Every failure factory call carries an ErrorCode, not just a Message
+
+`ServiceResult`/`ServiceResult<T>`'s `NotFound`, `Unauthorized`, `Forbidden`, `Conflict`, and `Fail` require an `ErrorCode` argument — the same resource key already passed to the localizer for `Message` (Rule 8). `ErrorCode` never changes with locale and never gets reworded; it's the value a client (mobile/frontend) branches on instead of parsing translated text (CLAUDE.md Architecture rule 10).
+
+**Correct:**
+```csharp
+if (product is null)
+{
+    _logger.LogWarning("Product {ProductId} not found", id);
+    return ServiceResult<ProductDetailsDto>.NotFound(_localizer["Product.NotFound", id], "Product.NotFound");
+}
+```
+
+**Wrong — never do this:**
+```csharp
+// ❌ No ErrorCode — a client can only branch on the localized Message, which changes with
+// Accept-Language and can be reworded in a copy edit without warning
+return ServiceResult<ProductDetailsDto>.NotFound(_localizer["Product.NotFound", id]);
+```
+
+`ValidationError` and `ServerError` keep a fixed default `ErrorCode` (`"Validation.Failed"`, `"Server.Error"`) — they're produced by the automatic FluentValidation pipeline and `ExceptionMiddleware`'s generic exception mapping, not authored per guard clause. Don't invent a per-field or per-exception-type code for these; that would duplicate `ExceptionMiddleware`'s dev/prod detail split (Rule 1 / CLAUDE.md "Error handling"), which stays the only place that decides exception-derived detail.
+
+See CLAUDE.md Architecture rule 10 and "Response envelope."
+
+---
+
 ## 3. Response Model Rules
 
 - **`<Entity>DetailsDto`** — single-item shape, used by get-by-id and create/update responses. Include navigation data the client actually renders (images, category name) — not raw foreign keys the client can't use.
 - **`<Entity>ProfileDto`** — list-row shape, deliberately smaller than `DetailsDto`. Never reuse the details DTO for a paginated list response — list endpoints are called far more often and the extra fields are wasted bandwidth at scale.
 - Request DTOs (`Create<Entity>Dto`, `Update<Entity>Dto`) carry only the fields the caller may set — never a server-assigned field like `Id` (on create), `CreatedAt`, or `RowVersion`.
+- **A response DTO exposes one resolved language field, never a raw `Name`/`NameAr` pair.** The AutoMapper profile picks the right value based on `CultureInfo.CurrentUICulture` at mapping time (Rule 8) — the client never branches on locale itself.
 
 ---
 
@@ -260,6 +377,7 @@ _logger.LogInformation($"Creating product {dto.Name}");   // ❌ interpolated st
 - One `<Entity>WithSpecs` class per entity, multiple constructors for different query shapes (by id, by SKU, paginated list with filters, etc.) — see `templates/layers/T2-repository.md`.
 - **Shared predicate/include logic across overloads must be extracted, not copy-pasted.** If three constructors all filter on the same multi-field search expression, factor it into a private static method or a composable `Expression<Func<T,bool>>` builder called from each constructor.
 - Every specification for a soft-deletable entity filters `DeletedAt == null` (or relies on a global EF Core query filter — see `patterns/P2-soft-delete-and-concurrency.md`).
+- A short-lived, low-entropy secret (a 6-digit OTP/verification code for email confirmation, password reset, phone verification, 2FA, ...) is never looked up by a hash-uniqueness index the way a high-entropy token (`RefreshToken`) is — its hash can collide across users/requests. The specification resolves `(UserId, not-yet-consumed)` first; the presented value's hash is compared only after that, in application code — see `patterns/P4-hashed-verification-code.md` for the full entity/spec/service shape.
 
 ---
 
@@ -284,20 +402,25 @@ Before marking a feature complete, verify every item:
 **Data layer**
 - [ ] Entity has `CreatedAt`/`UpdatedAt` (and `DeletedAt` if soft-deletable, `RowVersion` if written concurrently)
 - [ ] Configuration class declares keys, indexes (including composite indexes for real query patterns), and relationship delete behavior explicitly
+- [ ] Every user-facing text field has an `<Field>Ar` counterpart, and the AutoMapper profile resolves it to one DTO field by `CultureInfo.CurrentUICulture` (Rule 8)
+- [ ] `MockDataSeeder` has a matching `Seed<Entity>Async` method (normal case + at least one edge case), called only from the `IsDevelopment()` block (Rule 9)
 
 **Repository layer**
 - [ ] No domain-specific method added to `IGenericRepository<,>` (Rule 3)
 - [ ] Specification constructors share predicate logic instead of duplicating it (§4)
+- [ ] If this feature includes an OTP/verification code, it's looked up by `(UserId, not-yet-consumed)`, never by its hash (§4, `patterns/P4-hashed-verification-code.md`)
 
 **Service layer**
 - [ ] No whole-method `try/catch` swallowing exceptions into a generic failure (Rule 1)
 - [ ] `ILogger<TService>` injected and used per CLAUDE.md's Information/Warning/Error rules (Rule 7)
 - [ ] Multi-step writes across tables are transaction-wrapped (Rule 5)
 - [ ] DTOs contain no EF Core / entity references (Rule 4)
+- [ ] Every `ServiceResult` failure (`NotFound`/`Conflict`/`Unauthorized`/`Forbidden`/`Fail`) passes an `ErrorCode` using the same key as its localized message (Rule 10)
 
 **Validation**
 - [ ] Every mutating DTO has a validator class (Rule 2)
 - [ ] No manual shape-checking left in the service for anything the validator now owns
+- [ ] Every `ServiceResult`/validator message comes from `IStringLocalizer<SharedResource>`, not a hardcoded string literal (Rule 8), with both `.resx` files updated in the same commit
 
 **API layer**
 - [ ] Every mutating endpoint has an explicit `[Authorize]` or a stated reason it's public (Rule 6)
@@ -324,6 +447,7 @@ The following patterns were found in real production audits and must not appear 
 | Two `IActionResult` wrapper classes with different names doing identical `StatusCode`-from-`ServiceResult` work | Pure duplication with no behavioral difference; splits the codebase into two conventions for the same job, for no reason | Exactly one `ResultActionResult<T>` / `ResultActionResult` |
 | A domain-specific method (e.g. a formatted sequence-number generator) added directly to the generic repository interface | Every entity type now nominally exposes a method that only makes sense for one of them | Put it on `IUnitOfWork` or a dedicated repository interface (Rule 3) |
 | The same multi-field search predicate copy-pasted across several specification constructor overloads | A typo fix or business-rule change now has to be applied N times; overloads silently drift out of sync | Extract the shared predicate into one place, called from every overload (§4) |
+| Looking up a low-entropy secret (a 6-digit OTP/verification code) by a hash-uniqueness index, the way a high-entropy `RefreshToken` is | A 6-digit code has only 1,000,000 possible values — its hash *will* collide across users/requests at real scale, unlike a 64-byte random token's hash | Look up the active row by `(UserId, not-yet-consumed)` first, then compare the presented code's hash in application code with a constant-time comparison (§4, `patterns/P4-hashed-verification-code.md`) |
 | FluentValidation wired globally, but most DTOs have no validator class, so mutating endpoints fall back to ad hoc `if`-checks or nothing | Coverage looks systematic (one global registration call) but is actually sparse and inconsistent per endpoint | Every mutating DTO gets a validator the moment it's created — no validator is an incomplete feature, not an optional extra (Rule 2) |
 | `[Authorize]` commented out "temporarily" while testing | Ships as a live authorization gap the moment the branch merges; easy to forget, easy to miss in review | Never comment out an authorization attribute — use a role/policy actually satisfiable in the test environment instead (Rule 6) |
 | A fully-referenced third-party package with zero call sites anywhere in the codebase | Dead weight in the dependency tree and build; misleads readers into thinking it's in active use | Remove a package the moment its last call site is removed — a `.csproj` reference is not free |
@@ -332,3 +456,8 @@ The following patterns were found in real production audits and must not appear 
 | Secrets (DB password, signing key, third-party API key) committed directly in a tracked `appsettings.json` | Every clone — and every remote it's pushed to — now has the real credential in history; gitignoring afterward doesn't remove what's already committed | `dotnet user-secrets` locally, environment variables/secrets manager in deployed environments; rotate anything ever committed |
 | A per-request `Scoped` service injected directly into a `Singleton` constructor | The scoped instance is captured once and lives for the app's lifetime — a captive-dependency bug that surfaces as stale or cross-request data | Singletons needing scoped data take `IServiceScopeFactory` and create a scope per use |
 | Recurring or business-critical work implemented as fire-and-forget `Task.Run` instead of a hosted service or durable queue | No retry, no observability if the process recycles mid-run, silently drops the work on deploy | `IHostedService` for recurring/critical work; fire-and-forget reserved for genuinely best-effort side effects (§5) |
+| `ServiceResult`/validator messages hardcoded as English string literals while `Accept-Language`/`RequestLocalization` is wired in the pipeline | Looks localized because the middleware is there, but no message actually changes with culture — a real gap observed in a reference project's audit | Every message string comes from `IStringLocalizer<SharedResource>`, keyed and translated in both `.resx` files at creation time (Rule 8) |
+| A new entity's user-facing text field added without an `Ar` counterpart, "to add later when needed" | Retrofitting means a migration plus backfilling every existing row's `Ar` value — cheap now, expensive later | Add `<Field>Ar` alongside `<Field>` in the same migration that introduces the field (Rule 8) |
+| A new table ships with no seed data — QA/demo has nothing to look at until someone remembers to add sample rows later | The table sits empty through review and early testing; edge cases (empty fields, boundary values, soft-deleted rows) never get exercised until real data accumulates in production | Add `Seed<Entity>Async` to `MockDataSeeder` in the same change that adds the entity (Rule 9) |
+| Mock/demo seed data seeded unconditionally instead of behind `IsDevelopment()` | Fake `"Test Product 1"`-style rows ship into `Production` the moment the guard is missing | Gate `MockDataSeeder` calls strictly inside `app.Environment.IsDevelopment()`, same block as `Database.Migrate()` (Rule 9) |
+| A `ServiceResult` failure returned with only a localized `Message`, no `ErrorCode` | Client has no locale-independent, reword-safe value to branch on — forces fragile string-matching against translated text that changes with `Accept-Language` or a copy edit | Pass the same resource key already used for the localized `Message` as `ErrorCode` (Rule 10) |

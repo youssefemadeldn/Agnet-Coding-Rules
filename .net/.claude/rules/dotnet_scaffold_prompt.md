@@ -12,15 +12,17 @@ entities, services, or controllers — only the infrastructure layer.
 ---
 
 **Package context (ignore versions — use latest stable compatible with the target framework):**
-- ORM & database: `Microsoft.EntityFrameworkCore`, `Npgsql.EntityFrameworkCore.PostgreSQL`, `Microsoft.EntityFrameworkCore.Tools`
+- ORM & database: `Microsoft.EntityFrameworkCore`, `Npgsql.EntityFrameworkCore.PostgreSQL`, `Microsoft.EntityFrameworkCore.Tools` (on `<Solution>.Data`), `Microsoft.EntityFrameworkCore.Design` (on `<Solution>.WebAPI` — `dotnet ef` resolves tooling against the *startup* project, not the class library; without it `dotnet ef migrations add` fails outright)
 - Auth: `Microsoft.AspNetCore.Identity.EntityFrameworkCore`, `Microsoft.AspNetCore.Authentication.JwtBearer`, `System.IdentityModel.Tokens.Jwt`
 - Validation: `FluentValidation.AspNetCore`
 - Mapping: `AutoMapper.Extensions.Microsoft.DependencyInjection`
 - Logging: `Serilog.AspNetCore`
-- API surface: `Microsoft.AspNetCore.Mvc.Versioning`, `Microsoft.AspNetCore.Mvc.Versioning.ApiExplorer`, `Microsoft.AspNetCore.OpenApi`, `NSwag.AspNetCore`
+- API surface: `Asp.Versioning.Mvc`, `Asp.Versioning.Mvc.ApiExplorer` (the actively-maintained successor to the now-frozen `Microsoft.AspNetCore.Mvc.Versioning` — same versioning team, tracks .NET's own version numbering), `Microsoft.AspNetCore.OpenApi`, `NSwag.AspNetCore`
 - Caching/resilience: `Microsoft.Extensions.Caching.StackExchangeRedis`, `Polly`
 - Testing: `xunit`, `Moq`, `FluentAssertions`, `Bogus`, `Microsoft.AspNetCore.Mvc.Testing`, `Microsoft.EntityFrameworkCore.Sqlite`, `Testcontainers` (+ the module for any real external dependency, e.g. `Testcontainers.Redis`), `NetArchTest.Rules`
+- Localization: `Microsoft.Extensions.Localization` (`IStringLocalizer<T>`) + `Microsoft.AspNetCore.Localization` (`RequestLocalizationOptions`) — both ship inside the ASP.NET Core shared framework already referenced by `<Solution>.WebAPI`; no separate NuGet package needed. See CLAUDE.md "Localization."
 - Only add anything beyond this list when a concrete, active feature needs it (see CLAUDE.md "Dependencies rule") — never speculatively.
+- After installing, run `dotnet list package --vulnerable --include-transitive` across every project and substitute or pin any flagged package before writing code — a package's own "latest stable" can still be vulnerable if the package itself is stale or superseded, not just outdated.
 
 ---
 
@@ -99,6 +101,8 @@ Produce a complete file-by-file plan. For each file specify: full path, responsi
 **`<Solution>.Services`:**
 
 - `Helper/ServiceResult.cs` — the envelope from CLAUDE.md "Response envelope," written once here, never redefined per feature.
+- `Resources/SharedResource.cs` — an empty marker class (no members) that anchors `IStringLocalizer<SharedResource>` to the `Resources/` folder's `.resx` files. Created once, here, during scaffolding — see CLAUDE.md "Localization."
+- `Resources/SharedResource.en.resx`, `Resources/SharedResource.ar.resx` — the two resource files every `ServiceResult`/validator message key is added to, in both languages, in the same commit that introduces the message — never English-only "for now."
 - `Validators/` — empty until the first feature's validators exist; the assembly-scan registration (`AddValidatorsFromAssemblyContaining<T>`) is wired in `ServiceRegistration` pointing at whichever validator type exists first — update the anchor type as needed, but the registration call itself is written once, here.
 
 **`<Solution>.WebAPI`:**
@@ -106,9 +110,35 @@ Produce a complete file-by-file plan. For each file specify: full path, responsi
 - `Middleware/ExceptionMiddleware.cs`, `NotFoundException.cs`, `ValidationException.cs` — the one error boundary (CLAUDE.md "Error handling"). `ExceptionMiddleware` maps `ValidationException` → 422 with the errors dictionary, `NotFoundException` → 404, anything else → 500 with dev-only detail gated on `IHostEnvironment.IsDevelopment()`.
 - `Helpers/ResultActionResult.cs` — the one `IActionResult` wrapper (generic and non-generic overloads), reading `StatusCode` off the `ServiceResult`.
 - `Helpers/ServiceRegistration.cs` — `AddApplicationServices(this IServiceCollection)`: `IUnitOfWork`, `IGenericRepository<,>` (open generic registration), AutoMapper (`AddAutoMapper(AppDomain.CurrentDomain.GetAssemblies())`), FluentValidation (auto-validation + client-side adapters), `AddSignalR()` only if Phase-1 confirmed real-time is in scope, API versioning, authorization policies.
+- `Helpers/MockDataSeeder.cs` — a static `SeedAsync(YourSpaceDbContext context)` orchestrator, empty until the first feature's entity exists. Each feature adds its own `Seed<Entity>Async(context)` method here, called from `SeedAsync`. Development-only — see CLAUDE.md "Development Data Seeding." Distinct from any Identity/role bootstrap seeder, which carries real production data and is not gated behind `IsDevelopment()`.
 - `Extensions/IdentityServiceExtension.cs` — `AddIdentityService(IConfiguration)`: Identity + JWT bearer options (issuer/audience/signing key sourced from configuration, never hardcoded), token validation parameters.
 - `Extensions/RateLimitingExtension.cs` — `AddRateLimiting(...)` (spelled correctly — see feature prompt anti-patterns for why this matters).
-- `Extensions/SwaggerServiceExtension.cs` — `AddSwaggerDocumentation()` via NSwag, versioned per the `IApiVersionDescriptionProvider`.
+- `Extensions/SwaggerServiceExtension.cs` — `AddSwaggerDocumentation()` via NSwag, versioned per the `IApiVersionDescriptionProvider`. The provider isn't resolvable yet when this method runs — the container isn't built — so read it off a short-lived temporary provider scoped only to this lookup, then register one `AddOpenApiDocument` per version:
+  ```csharp
+  public static IServiceCollection AddSwaggerDocumentation(this IServiceCollection services)
+  {
+      services.AddEndpointsApiExplorer();
+
+      // Temporary provider used only to read the already-registered API version descriptions —
+      // resolves no scoped services, so this is safe despite the ASP0000 warning.
+  #pragma warning disable ASP0000
+      using var tempProvider = services.BuildServiceProvider();
+  #pragma warning restore ASP0000
+      var versionProvider = tempProvider.GetRequiredService<IApiVersionDescriptionProvider>();
+
+      foreach (var description in versionProvider.ApiVersionDescriptions)
+      {
+          services.AddOpenApiDocument(config =>
+          {
+              config.DocumentName = description.GroupName;
+              config.ApiGroupNames = [description.GroupName];
+              config.Version = description.ApiVersion.ToString();
+          });
+      }
+
+      return services;
+  }
+  ```
 - `Program.cs` — see the required pipeline order below.
 - `appsettings.json` — shape only (empty `ConnectionStrings`, `Token` issuer/audience with no key value, feature-flag-style settings sections with safe defaults). `appsettings.Development.json` may contain non-secret local defaults (e.g. a localhost connection string with a throwaway local password is acceptable for local-only Development config **if and only if** that password grants no access to anything beyond a disposable local dev database — when in doubt, use `user-secrets` even for Development).
 - `.editorconfig` at the solution root — see "Baseline `.editorconfig`" below.
@@ -125,23 +155,26 @@ Produce a complete file-by-file plan. For each file specify: full path, responsi
 Middleware order is load-bearing — reordering silently changes behavior:
 
 ```
-builder.Services: Controllers (+ enum-as-string JSON converter) → DataProtection → CORS policy
+builder.Services: Controllers (+ enum-as-string JSON converter) → AddLocalization() + RequestLocalizationOptions (en default, en/ar supported)
+                → DataProtection → CORS policy
                 → DbContext → Redis multiplexer → Options bindings (typed settings classes)
                 → AddApplicationServices() → HostedServices → AddIdentityService()
                 → AddRateLimiting() → AddSwaggerDocumentation()
                 → AddHttpLogging() (Development only)
 
-app: (Development: UseOpenApi + UseSwaggerUi + UseHttpLogging)
+app: (Development: Database.Migrate() + MockDataSeeder.SeedAsync(...) + UseOpenApi + UseSwaggerUi + UseHttpLogging)
    → UseHsts() → UseHttpsRedirection()
    → UseCors(...)                          # before authentication/authorization, always
    → UseExceptionHandler("/error") → UseMiddleware<ExceptionMiddleware>()
    → UseRateLimiter()
-   → UseRequestLocalization(...)           # only if the API serves more than one culture
+   → UseRequestLocalization(...)           # always — en/ar from day one, see CLAUDE.md "Localization"
    → UseAuthentication() → UseAuthorization()
    → MapControllers() → MapHub<...>(...)   # only if SignalR is in scope
 ```
 
 `UseCors` must run before `UseAuthentication`/`UseAuthorization` — a preflight request never carries credentials, so CORS has to be settled first. If any SignalR hub needs `AllowCredentials()`, the CORS policy cannot also use `AllowAnyOrigin()` — it must list explicit origins (wildcarded subdomains are fine via `SetIsOriginAllowedToAllowWildcardSubdomains()`).
+
+`Database.Migrate()` runs first in the `Development` block — before `UseOpenApi`/`UseSwaggerUi`/`UseHttpLogging` — so the API docs and request logging never come up against a schema that isn't there yet. See edge case 9 below for why this must stay `Development`-only.
 
 ---
 
@@ -161,6 +194,9 @@ Create one at the solution root covering, at minimum: file-scoped namespaces pre
 6. **Rate limiting scope:** confirm which endpoints (all vs. auth-sensitive only, e.g. login/OTP) need rate limiting in the first pass — don't apply a single blanket policy without checking whether any endpoint (webhooks from a payment/notification provider, for instance) needs to be exempted.
 7. **Retry strategy vs. manual transactions:** if `EnableRetryOnFailure` is ever added to the `DbContext` options, every `BeginTransactionAsync` call site in the codebase must be wrapped in `IExecutionStrategy.ExecuteAsync(...)` per EF Core's docs — Npgsql's (and SQL Server's) retrying execution strategy is incompatible with user-initiated transactions otherwise. Default to **not** enabling retry-on-failure until this is deliberately taken on solution-wide.
 8. **Nullable reference types on entities:** EF Core sets non-nullable entity properties via reflection/materialization, bypassing constructor nullability checks — decide up front whether required scalar properties use `required` (C# 11+) or are left implicitly non-null-but-uninitialized, and apply the choice consistently rather than mixing both across entities.
+9. **Auto-migrate on boot vs. explicit deploy step:** `Program.cs` may call `Database.Migrate()` after `WebApplication.Build()` to create the database and apply pending migrations automatically — if included, gate it strictly behind `IsDevelopment()`. Never call it unconditionally: concurrent instances racing to migrate, and unreviewed schema changes landing on a live database as a side effect of a restart, are real risks in `Production`. `Production` always applies migrations via the explicit `dotnet ef database update` command from CLAUDE.md's Commands section, run as a deliberate deploy step.
+10. **Resx satellite assemblies must actually publish:** `.resx` files compile to satellite assemblies per culture (e.g. `ar/<Solution>.Services.resources.dll`). Confirm the publish profile/Dockerfile copies them alongside the main assembly — a `.resx` that builds locally but isn't present in the deployed `ar/` folder silently falls back to the neutral (English) resource with no error, which is easy to miss until an Arabic-locale request in production quietly returns English text.
+11. **`MockDataSeeder` runs strictly after `Database.Migrate()`, inside the same `IsDevelopment()` block, never outside it:** seeding before the schema exists throws; seeding outside the `IsDevelopment()` guard is exactly the mistake CLAUDE.md's "Development Data Seeding" section calls out — fake rows shipping into `Production`. Each per-entity `Seed<Entity>Async` method must also be independently idempotent (existence check first), because `dotnet run` re-executes this block on every local restart.
 
 ---
 
