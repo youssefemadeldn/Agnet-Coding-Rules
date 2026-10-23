@@ -17,6 +17,12 @@ Each project's own `CLAUDE.md` (and its `.claude/rules/`, `.claude/templates/`) 
 - If a task spans both projects (e.g. a new backend endpoint plus the mobile screen that calls it), keep each project's rules strictly inside its own folder rather than blending them into one style.
 - If a request doesn't make the target project obvious before any file has been touched yet, ask rather than guessing.
 
+## Repo docs
+
+- `doc/context/technical-decisions.md` — why the repo is shaped this way, and the 9 quality pillars every rule encodes. Read it before changing the structure or adding a rule.
+- `doc/lessons.md` — gotchas, including the review bar (flag functional slips, not cosmetic ones).
+- `doc/handoffs/` — past session handoffs (history, not current rules).
+
 ## Adding a project
 
 A new project (e.g. a frontend) gets its own top-level folder with its own `CLAUDE.md` + `.claude/rules/` + `.claude/templates/`, plus a new row above. Its rules load the same way — nothing else here needs to change.
